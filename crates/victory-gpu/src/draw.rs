@@ -912,7 +912,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let tabling = std::time::Instant::now();
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase("part: bind tables", tabling);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -923,6 +927,8 @@ impl State {
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
+            #[cfg(feature = "diagnostics")]
+            let addressing = std::time::Instant::now();
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 let Some(ready) = self.memory_ready(list, compute, writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
@@ -932,6 +938,10 @@ impl State {
             } else {
                 None
             };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase("part: bind memory by address", addressing);
+            #[cfg(feature = "diagnostics")]
+            let rooting = std::time::Instant::now();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -957,6 +967,8 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase("part: bind user data", rooting);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1722,7 +1734,12 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        #[cfg(feature = "diagnostics")]
+        let binding = std::time::Instant::now();
+        let bound = self.bind(list, p, true);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase("part: dispatch bind", binding);
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -1923,11 +1940,15 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        #[cfg(feature = "diagnostics")]
+        let entering = std::time::Instant::now();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase("part: tables, entries of the title's tables", entering);
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -1977,6 +1998,8 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let freshening = std::time::Instant::now();
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
@@ -2007,6 +2030,8 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::phase("part: fresh table found again", freshening);
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -2066,6 +2091,8 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::phase("part: fresh table made", freshening);
         }
         made
     }
@@ -2450,12 +2477,16 @@ impl State {
                 (bounded, 0)
             }
         };
+        #[cfg(feature = "diagnostics")]
+        let binding = std::time::Instant::now();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::phase("part: indirect prepare and bind", binding);
         if !ran {
             crate::indirect::done(list, &bounded);
             why("prepare failed");
@@ -2570,12 +2601,29 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    readable_in(list, kind, view);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::phase("part: readable", started);
+}
+
+fn readable_in(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    #[cfg(feature = "diagnostics")]
+    let placing = std::time::Instant::now();
     let placed = crate::descriptor::host::placed_texture(view);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::phase("part: readable placed texture", placing);
     let view = placed.as_ref().unwrap_or(view);
+    #[cfg(feature = "diagnostics")]
+    let buffering = std::time::Instant::now();
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
+    let copy = crate::descriptor::host::buffer_copy(view);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::phase("part: readable buffer copy lookup", buffering);
+    if let Some((shadow, address, len)) = copy {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
             // A shader that cannot store to buffers leaves the range as

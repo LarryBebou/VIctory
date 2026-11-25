@@ -953,6 +953,66 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 }
 
 /// A list call on this thread that began at `started` has returned.
+/// List-call time by method (diagnostics): name → (calls, nanoseconds,
+/// nanoseconds waiting for the list's state lock), kept per thread and
+/// added here a few milliseconds at a time.
+static BY_CALL: Mutex<Vec<(&'static str, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static BY_CALL_HERE: std::cell::RefCell<(u64, Vec<(&'static str, u64, u64, u64)>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// A list method `name` took `took`, `locked` of it for the list's state.
+pub(crate) fn recorded_by(name: &'static str, took: std::time::Duration, locked: std::time::Duration) {
+    let (ns, lock_ns) = (took.as_nanos() as u64, locked.as_nanos() as u64);
+    BY_CALL_HERE.with(|here| {
+        let mut here = here.borrow_mut();
+        match here.1.iter_mut().find(|e| std::ptr::eq(e.0, name)) {
+            Some(e) => (e.1, e.2, e.3) = (e.1 + 1, e.2 + ns, e.3 + lock_ns),
+            None => here.1.push((name, 1, ns, lock_ns)),
+        }
+        here.0 += ns;
+        if here.0 < 2_000_000 {
+            return;
+        }
+        here.0 = 0;
+        let mut all = BY_CALL.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, calls, ns, lock_ns) in here.1.drain(..) {
+            match all.iter_mut().find(|e| e.0 == name) {
+                Some(e) => (e.1, e.2, e.3) = (e.1 + calls, e.2 + ns, e.3 + lock_ns),
+                None => all.push((name, calls, ns, lock_ns)),
+            }
+        }
+    });
+}
+
+/// A part of a list method, from `started` (diagnostics): counted beside
+/// the methods, under `name`.
+pub(crate) fn phase(name: &'static str, started: std::time::Instant) {
+    recorded_by(name, started.elapsed(), std::time::Duration::ZERO);
+}
+
+/// For the frame line: the list methods that took longest, per frame.
+pub(crate) fn by_call_line(frames: f64) {
+    let mut all = std::mem::take(&mut *BY_CALL.lock().unwrap_or_else(|e| e.into_inner()));
+    all.sort_by_key(|e| std::cmp::Reverse(e.2));
+    let parts: Vec<String> = all
+        .iter()
+        .take(16)
+        .map(|(name, calls, ns, lock_ns)| {
+            let short = name.trim_end_matches("::{{closure}}").rsplit("::").next().unwrap_or(name);
+            format!(
+                "{short} {:.0}x {:.1} ms ({:.1} ms for the state lock)",
+                *calls as f64 / frames,
+                *ns as f64 / 1e6 / frames,
+                *lock_ns as f64 / 1e6 / frames
+            )
+        })
+        .collect();
+    tracing::info!("list calls by method per frame, longest first: {}", parts.join("; "));
+}
+
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);

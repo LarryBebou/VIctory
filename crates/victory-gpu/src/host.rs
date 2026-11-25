@@ -5902,6 +5902,8 @@ impl Meter {
                 );
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::by_call_line(frames);
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
