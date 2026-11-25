@@ -5906,6 +5906,17 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        {
+            let [mirror, slots, whole, refresh, textures] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_PASS_SPLIT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the pass over the heap's views per frame: {:.1} ms making {slots:.0} slots again ({whole:.2} whole passes), \
+                 {:.1} ms asking their refreshes, {:.1} ms on textures picked by index",
+                mirror / 1e3,
+                refresh / 1e3,
+                textures / 1e3
+            );
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);

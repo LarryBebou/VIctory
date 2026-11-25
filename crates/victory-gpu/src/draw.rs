@@ -325,6 +325,10 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of [`HEAP_BUFFER_MICROS`] (diagnostics): microseconds making the slots
+/// looked at again, how many slots, whole passes; microseconds of the
+/// refreshes asked; microseconds of the texture side.
+pub(crate) static HEAP_PASS_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1331,6 +1335,10 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        HEAP_PASS_SPLIT[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        if (*passes - 1) % 16 == 0 {
+            HEAP_PASS_SPLIT[2].fetch_add(1, Ordering::Relaxed);
+        }
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1366,6 +1374,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        HEAP_PASS_SPLIT[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let refreshing = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1409,7 +1419,10 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        HEAP_PASS_SPLIT[3].fetch_add(refreshing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let texturing = std::time::Instant::now();
         self.heap_textures(list, heap, host);
+        HEAP_PASS_SPLIT[4].fetch_add(texturing.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
