@@ -1213,6 +1213,8 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    #[cfg(feature = "diagnostics")]
+    card_back_line(frames);
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -1781,7 +1783,21 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    ///
+    /// `from` names the declaring place for the diagnostics line of wide
+    /// declarations (16 MiB and more: a read of any byte in them waits for
+    /// the flight to land).
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, from: &'static str) {
+        #[cfg(feature = "diagnostics")]
+        if len >= 16 << 20 {
+            static SEEN: Mutex<Vec<(&'static str, u64, u64)>> = Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.len() < 64 && !seen.contains(&(from, address, len)) {
+                seen.push((from, address, len));
+                tracing::info!(from, address = format_args!("{address:#x}"), len = format_args!("{len:#x}"), "a wide range declared written by shaders");
+            }
+        }
+        let _ = from;
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -2744,12 +2760,44 @@ impl Shadow {
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
+        #[cfg(feature = "diagnostics")]
+        card_back(self.start, self.len, gpu.len() as u64, if mapped && changed { n as u64 } else { 0 });
         if !mapped || !changed {
             return 0;
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
+    }
+}
+
+/// Per copy in the card's memory (start, length), since the last frame
+/// line: the bytes of pieces fetched that differ from the CPU's side, and
+/// the bytes written into title memory from them (diagnostics: which
+/// copies shaders really write).
+#[cfg(feature = "diagnostics")]
+static CARD_BACK: Mutex<BTreeMap<(u64, u64), (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+#[cfg(feature = "diagnostics")]
+fn card_back(start: u64, len: u64, differing: u64, written: u64) {
+    let mut back = CARD_BACK.lock().unwrap_or_else(|e| e.into_inner());
+    let e = back.entry((start, len)).or_insert((0, 0));
+    e.0 += differing;
+    e.1 += written;
+}
+
+/// The copies in the card's memory whose shader writes reached title
+/// memory most, per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_back_line(frames: f64) {
+    let mut all: Vec<((u64, u64), (u64, u64))> = std::mem::take(&mut *CARD_BACK.lock().unwrap_or_else(|e| e.into_inner())).into_iter().collect();
+    all.sort_by_key(|e| std::cmp::Reverse(e.1.0));
+    for ((start, len), (differing, written)) in all.into_iter().take(12) {
+        tracing::info!(
+            "  card copy {start:#x}+{len:#x}: {:.2} MB a frame of fetched bytes that differ, {:.2} MB of them written into title memory",
+            differing as f64 / frames / 1e6,
+            written as f64 / frames / 1e6
+        );
     }
 }
 

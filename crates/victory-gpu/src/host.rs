@@ -2133,6 +2133,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blocked_fill(written, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2515,11 +2517,41 @@ fn relay_hand_back(back: &[Declared]) {
     }
 }
 
+/// Fills of upload memory that waited for flights since the last frame
+/// line: the fill's range and the range flights may write that it met,
+/// with how many times (diagnostics: whether the declared writes are as
+/// wide as the memory the shaders could write, or what the title reads
+/// back is what the card just wrote).
+#[cfg(feature = "diagnostics")]
+static BLOCKED_FILLS: Mutex<Vec<((usize, usize), (usize, usize), u64)>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn blocked_fill(written: &[(usize, usize)], src: usize, len: usize) {
+    let at = written.partition_point(|r| r.1 <= src);
+    let Some(&met) = written.get(at) else {
+        return;
+    };
+    let mut fills = BLOCKED_FILLS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = fills.iter_mut().find(|f| f.0 == (src, len) && f.1 == met) {
+        f.2 += 1;
+    } else if fills.len() < 64 {
+        fills.push(((src, len), met, 1));
+    }
+}
+
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
     if !late() {
         return;
+    }
+    #[cfg(feature = "diagnostics")]
+    for ((src, len), (a, b), n) in std::mem::take(&mut *BLOCKED_FILLS.lock().unwrap_or_else(|e| e.into_inner())) {
+        tracing::info!(
+            "  a fill of upload memory waited for flights: {src:#x}+{len:#x} met a range flights may write {a:#x}+{:#x}, {:.1}x/frame",
+            b - a,
+            n as f64 / frames
+        );
     }
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
