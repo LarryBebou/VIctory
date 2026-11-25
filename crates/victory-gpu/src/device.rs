@@ -396,7 +396,48 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    dump_pipeline_description(SLOT, calls, desc as usize);
     E_NOTIMPL
+}
+
+/// Debugging aid: `VICTORY_DUMP_PIPELINES=<folder>` writes, for the first 256
+/// calls of each unknown pipeline method, the description's sixteen words
+/// (`<slot>-<call>/desc.bin`) and every word pair in it that reads as a
+/// pointer and a size of at most 1 MiB (`<slot>-<call>/<word index>.bin`),
+/// so that the two descriptions can be decoded. Reads go through the kernel.
+/// The files hold the title's own data: they are for this machine only.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_pipeline_description(slot: usize, call: u32, desc: usize) {
+    static FOLDER: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_DUMP_PIPELINES").map(Into::into));
+    let Some(folder) = FOLDER.as_ref() else { return };
+    if call > 256 || desc == 0 {
+        return;
+    }
+    let mut head = [0u8; 128];
+    if !crate::host::read_into(desc as *const u8, &mut head) {
+        return;
+    }
+    let words: Vec<u64> = head
+        .as_chunks::<8>().0.iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let dir = folder.join(format!("{slot:x}-{call:05}"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join("desc.bin"), head);
+    for i in 0..words.len() - 1 {
+        let (at, size) = (words[i], words[i + 1]);
+        if !(0x1_0000..0x7fff_0000_0000).contains(&at) || size == 0 || size > 1 << 20 {
+            continue;
+        }
+        let mut bytes = vec![0u8; size as usize];
+        if crate::host::read_into(at as *const u8, &mut bytes) {
+            let _ = std::fs::write(dir.join(format!("{i:02}.bin")), &bytes);
+        }
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
