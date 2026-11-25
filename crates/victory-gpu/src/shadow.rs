@@ -1324,6 +1324,27 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// The blocks of `block` bytes (the last one may be shorter) where `now`
+/// differs from `was` (of one length), adjacent ones joined, as `(start,
+/// end)` in order: every differing byte is in one, and no block in one is
+/// equal throughout.
+fn differing_blocks(now: &[u8], was: &[u8], block: usize) -> Vec<(usize, usize)> {
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let end = (at + block).min(n);
+        if now[at..end] != was[at..end] {
+            match runs.last_mut() {
+                Some(last) if last.1 == at => last.1 = end,
+                _ => runs.push((at, end)),
+            }
+        }
+        at = end;
+    }
+    runs
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -1353,7 +1374,28 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, differing_blocks};
+
+    /// Blocks that differ are joined when they touch, a short last block
+    /// counts, and equal blocks are left out.
+    #[test]
+    fn differing_blocks_cover_every_change_and_no_equal_block() {
+        let was = vec![0u8; 10_000];
+        let mut now = was.clone();
+        now[5] = 1; // block 0
+        now[4096] = 1; // block 1, joined with block 0
+        now[9_999] = 1; // the short last block
+        assert_eq!(differing_blocks(&now, &was, 4096), vec![(0, 10_000)]);
+        now[4096] = 0;
+        assert_eq!(differing_blocks(&now, &was, 4096), vec![(0, 4096), (8192, 10_000)]);
+        assert!(differing_blocks(&was, &was, 4096).is_empty());
+        // Putting the blocks of `now` into `was` gives `now`.
+        let mut put = was.clone();
+        for (a, b) in differing_blocks(&now, &was, 4096) {
+            put[a..b].copy_from_slice(&now[a..b]);
+        }
+        assert_eq!(put, now);
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2451,12 +2493,76 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if self.card.is_some() {
+            return self.copy_to_card(from, to);
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        to - from
+    }
+
+    /// [`Shadow::copy`] for a copy in the card's memory: only the bytes
+    /// that differ from the CPU's side are put there and go up.
+    ///
+    /// The write watch answers by 64 KiB page, and a page counts as written
+    /// for our own writes too: what a submission's shaders wrote is copied
+    /// back into title memory (`card_merge`, `copy_back`), which marks the
+    /// page, and the next refresh copied the whole page again and sent it to
+    /// the card, which held those bytes already (run "gpu-range": 89 MB sent
+    /// up a frame beside 65-87 MB copied back). Outside the ranges shaders
+    /// are writing ([`Shadow::update`] skips those) the CPU's side is what
+    /// the card holds or is about to receive, so bytes the title holds as
+    /// the CPU's side does have nothing to send.
+    fn copy_to_card(&self, from: usize, to: usize) -> usize {
+        const CHUNK: usize = 64 << 10;
+        /// What is compared and sent up as one: the kernel's page.
+        const BLOCK: usize = 4 << 10;
+        thread_local! {
+            static READ: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(vec![0; CHUNK]);
+        }
+        let start = self.start as usize;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CardCopied, (to - from) as u64);
+        READ.with(|read| {
+            let mut read = read.borrow_mut();
+            let mut at = from;
+            while at < to {
+                let n = (to - at).min(CHUNK);
+                let (o, e) = (at - start, at + n - start);
+                // SAFETY: inside the mapping (`from` and `to` are within the
+                // buffer); only the submitting thread writes it.
+                let cpu = unsafe { std::slice::from_raw_parts_mut(self.data.add(o), n) };
+                // SAFETY: our own buffer of `CHUNK` bytes; the source may be
+                // anything (a missing page is reported).
+                if !unsafe { crate::safecopy::copy(read.as_mut_ptr(), at as *const u8, n) } {
+                    // A page is not there: as before, the copy's own path
+                    // (unmapped pages read as zeros), all of it sent up.
+                    crate::host::copy_mapped(cpu.as_mut_ptr(), at as *const u8, n, false);
+                    self.changed(o, e);
+                    self.card_changed(o, e);
+                } else {
+                    // By blocks, those that differ joined into runs: each
+                    // run is a copy command and a hash pass on the card,
+                    // and byte runs made 374,282 of them a frame (run
+                    // "gpu-cardsame": 0.4-1 fps) for 2.5 MB.
+                    let mut same = n;
+                    for (a, b) in differing_blocks(&read[..n], cpu, BLOCK) {
+                        cpu[a..b].copy_from_slice(&read[a..b]);
+                        self.changed(o + a, o + b);
+                        self.card_changed(o + a, o + b);
+                        same -= b - a;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::CardSame, same as u64);
+                    let _ = same;
+                }
+                at += n;
+            }
+        });
         to - from
     }
 
