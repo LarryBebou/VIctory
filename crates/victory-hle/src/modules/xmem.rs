@@ -602,7 +602,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping(&[changed(&physical, address as usize, n * PAGE)]);
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
     if map_pages(&mut physical, address as usize, n, pages) {
@@ -613,8 +613,8 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// [`XMemMapPhysicalPages`] with the physical-page lock and
-/// `victory_gpu::title_memory_remapping` already held by the caller, so
-/// that a batch of mappings takes them once: false if a page or the host
+/// `victory_gpu::title_memory_remapping` (over [`changed`]) already held by
+/// the caller, so that a batch of mappings takes them once: false if a page or the host
 /// fails.
 fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
     unmap(physical, base, n * PAGE);
@@ -657,11 +657,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     }
     // Both locks once for the whole batch, not once per page: while the
     // world streams in the title scatters thousands of pages a frame, and
-    // every texture refresh waits for `title_memory_remapping` to be free
+    // every texture refresh that meets one waits for `title_memory_remapping`
     // (texture.rs `no_wait`): taken page by page, that wait was 1.5-2.8 s of
     // a 2-6 s frame on an RTX 5060.
     let mut physical = physical();
-    let _changing = victory_gpu::title_memory_remapping();
+    // SAFETY: the title passes `n` addresses.
+    let ranges: Vec<(usize, usize)> =
+        (0..n).map(|i| changed(&physical, unsafe { *addresses.add(i) } as usize, PAGE)).collect();
+    let _changing = victory_gpu::title_memory_remapping(&ranges);
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -690,7 +693,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = victory_gpu::title_memory_remapping(&[changed(&physical, to, len)]);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -808,6 +811,29 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// What [`unmap`] of `[base, base + len)` changes, as `(start, end)`: the
+/// range and every view that meets it, which it takes away whole and maps
+/// again in part. Reads in place there wait for the change
+/// (`victory_gpu::title_memory_remapping`); reads elsewhere do not.
+fn changed(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
+    let end = base.saturating_add(len);
+    if len == 0 {
+        return (base, end);
+    }
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .map_or(base, |(at, _)| *at);
+    let last = physical
+        .views
+        .range(base..end)
+        .next_back()
+        .map_or(end, |(at, (size, _))| end.max(at + size));
+    (first, last)
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1191,7 +1217,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading();
+                    let _reading = victory_gpu::title_memory_reading(first, 1);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.

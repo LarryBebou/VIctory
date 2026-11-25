@@ -599,40 +599,139 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+///
+/// Only the memory a change touches and the memory a read covers can
+/// meet: a lock over all title memory made every texture refresh wait for
+/// the title's remapping of unrelated pages, and the title for every
+/// texture read (run "gpu-barrier": 150-400 ms a frame of "waiting for
+/// title memory to hold still" while the world streamed in). So reads and
+/// changes name their ranges, and wait only for those that overlap.
+struct Mapping {
+    /// Numbers the changes.
+    next: u64,
+    /// The changes under way, and those waiting for reads to end: each its
+    /// ranges `(start, end)`, in order and apart. A read waits for both, so
+    /// that reads that keep coming cannot hold a change off.
+    changing: Vec<(u64, Vec<(usize, usize)>)>,
+    waiting: Vec<(u64, Vec<(usize, usize)>)>,
+    /// The reads in place under way.
+    reading: Vec<(usize, usize)>,
+}
+
+static MAPPING: std::sync::Mutex<Mapping> = std::sync::Mutex::new(Mapping {
+    next: 0,
+    changing: Vec::new(),
+    waiting: Vec::new(),
+    reading: Vec::new(),
+});
+static MAPPING_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn mapping() -> std::sync::MutexGuard<'static, Mapping> {
+    MAPPING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `[a, b)` meets one of `ranges` (in order and apart).
+fn meets(ranges: &[(usize, usize)], (a, b): (usize, usize)) -> bool {
+    let i = ranges.partition_point(|&(_, end)| end <= a);
+    ranges.get(i).is_some_and(|&(start, _)| start < b)
+}
+
+impl Mapping {
+    /// Whether a read of `range` would meet a change under way or waiting.
+    fn blocks_read(&self, range: (usize, usize)) -> bool {
+        self.changing.iter().chain(&self.waiting).any(|(_, r)| meets(r, range))
+    }
+
+    /// Whether the change `ranges` would meet a read or another change.
+    fn blocks_change(&self, ranges: &[(usize, usize)]) -> bool {
+        self.reading.iter().any(|&r| meets(ranges, r))
+            || self.changing.iter().any(|(_, theirs)| theirs.iter().any(|&r| meets(ranges, r)))
+    }
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(u64);
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        mapping().changing.retain(|(id, _)| *id != self.0);
+        MAPPING_MOVED.notify_all();
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+/// memory over `ranges` (`(start, end)`, any order): until what it returns
+/// is dropped, no read of title memory in place that meets them is under
+/// way and none begins ([`title_memory_reading`]). Taken around the whole
+/// change, the unmapping and the mapping again, and over every view the
+/// change takes away to map again in part.
+pub fn title_memory_remapping(ranges: &[(usize, usize)]) -> Remapping {
+    let mut mine: Vec<(usize, usize)> = ranges.iter().copied().filter(|r| r.0 < r.1).collect();
+    mine.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(mine.len());
+    for (start, end) in mine {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    let mut m = mapping();
+    m.next += 1;
+    let id = m.next;
+    if m.blocks_change(&joined) {
+        m.waiting.push((id, joined.clone()));
+        while m.blocks_change(&joined) {
+            m = MAPPING_MOVED.wait(m).unwrap_or_else(|e| e.into_inner());
+        }
+        m.waiting.retain(|(w, _)| *w != id);
+    }
+    m.changing.push((id, joined));
+    Remapping(id)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading((usize, usize));
 
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut m = mapping();
+        if let Some(i) = m.reading.iter().position(|&r| r == self.0) {
+            m.reading.swap_remove(i);
+        }
+        let waited = !m.waiting.is_empty();
+        drop(m);
+        if waited {
+            MAPPING_MOVED.notify_all();
+        }
+    }
+}
+
+/// For reading title memory `[at, at + len)` in place: until what it
+/// returns is dropped, the runtime changes no mapping there, so memory
+/// found mapped stays mapped. Not to be taken twice by one thread, nor
+/// held across anything that maps title memory.
+pub fn title_memory_reading(at: usize, len: usize) -> Reading {
+    let range = (at, at.saturating_add(len));
+    let mut m = mapping();
+    while m.blocks_read(range) {
+        m = MAPPING_MOVED.wait(m).unwrap_or_else(|e| e.into_inner());
+    }
+    m.reading.push(range);
+    Reading(range)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// runtime changes a mapping there (or waits to), for a caller that has
+/// another way to read and would rather not wait.
+pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    let range = (at, at.saturating_add(len));
+    let mut m = mapping();
+    if m.blocks_read(range) {
+        return None;
     }
+    m.reading.push(range);
+    Some(Reading(range))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1070,13 +1169,13 @@ mod mapping_tests {
     fn reads_in_place_and_remappings_wait_for_each_other() {
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
-        let reading = title_memory_reading();
+        let reading = title_memory_reading(0x1000_0000, 0x1_0000);
         let (began, wait) = mpsc::channel();
         let change = {
             let changed = changed.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _changing = title_memory_remapping();
+                let _changing = title_memory_remapping(&[(0x1000_8000, 0x1001_0000)]);
                 changed.store(true, Ordering::SeqCst);
             })
         };
@@ -1088,13 +1187,13 @@ mod mapping_tests {
         assert!(changed.load(Ordering::SeqCst));
         // A change holds; the read does not begin until it is done.
         let read = Arc::new(AtomicBool::new(false));
-        let changing = title_memory_remapping();
+        let changing = title_memory_remapping(&[(0x1000_0000, 0x1000_1000)]);
         let (began, wait) = mpsc::channel();
         let reader = {
             let read = read.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _reading = title_memory_reading();
+                let _reading = title_memory_reading(0x1000_0fff, 2);
                 read.store(true, Ordering::SeqCst);
             })
         };
@@ -1104,5 +1203,17 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A read and a change of other memory do not wait for each other,
+    /// and a change of scattered pages waits only for a read that meets one.
+    #[test]
+    fn reads_and_remappings_of_other_memory_go_on_together() {
+        let _reading = title_memory_reading(0x2000_0000, 0x1_0000);
+        let _changing = title_memory_remapping(&[(0x2001_0000, 0x2002_0000), (0x1f00_0000, 0x1f01_0000)]);
+        let _another = title_memory_reading(0x2003_0000, 0x1_0000);
+        assert!(super::title_memory_reading_now(0x2001_8000, 4).is_none());
+        assert!(super::title_memory_reading_now(0x1f00_fff0, 0x100).is_none());
+        assert!(super::title_memory_reading_now(0x1f01_0000, 0x100).is_some());
     }
 }
