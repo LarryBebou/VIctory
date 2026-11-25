@@ -5471,7 +5471,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    // Into a copy of ours: a plain copy that reports a missing page
+    // (`crate::safecopy`). Into title memory: the kernel's write, which
+    // keeps clear of the title's guards and protections.
+    let whole = if title_dst {
+        read(src, dst, len)
+    } else {
+        // SAFETY: the caller's destination is a host copy of `len` bytes.
+        unsafe { crate::safecopy::copy(dst, src, len) }
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5551,7 +5559,8 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    read(src, dst.as_mut_ptr(), dst.len())
+    // SAFETY: `dst` is ours and borrowed whole for the copy.
+    unsafe { crate::safecopy::copy(dst.as_mut_ptr(), src, dst.len()) }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
