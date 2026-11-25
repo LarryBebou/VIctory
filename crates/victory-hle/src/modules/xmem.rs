@@ -678,19 +678,29 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
-    unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
-        return address;
+    // SAFETY: the title passes `n` page numbers, or null.
+    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    if map_pages(&mut physical, address as usize, n, pages) {
+        address
+    } else {
+        std::ptr::null_mut()
     }
-    // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+}
+
+/// [`XMemMapPhysicalPages`] with the physical-page lock already held by the
+/// caller, so that a batch of mappings takes it once: false if a page or
+/// the host fails.
+fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
+    unmap(physical, base, n * PAGE);
+    let Some(pages) = pages else {
+        return true;
+    };
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
+            return false;
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -702,12 +712,12 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
+            return false;
         }
         i += run;
     }
-    address
+    true
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -720,19 +730,23 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    // The lock once for the whole batch, not once per page: while the world
+    // streams in, the title scatters thousands of pages a frame, and every
+    // other thread that maps, frees or looks up physical memory waits on it.
+    let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
             (
-                *addresses.add(i),
+                *addresses.add(i) as usize,
                 if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
+                    None
                 } else {
-                    pages.add(i)
+                    Some(std::slice::from_raw_parts(pages.add(i), 1))
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        if !map_pages(&mut physical, address, 1, page) {
             return 0;
         }
     }
