@@ -814,6 +814,52 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    // Diagnostics: the planes of the first presents with more than one,
+    // to learn where the second plane's description starts (its
+    // resources found at a stride, with their host sizes and formats).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if planes > 1 && !plane_parameters.is_null() {
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+            // Read through the reporting copy: a guessed stride may name
+            // memory that is not there (a plain read of one crashed).
+            let read = |at: usize, len: usize| -> Option<Vec<u8>> {
+                let mut out = vec![0u8; len];
+                // SAFETY: our own buffer of `len` bytes; the source is reported if missing.
+                unsafe { crate::safecopy::copy(out.as_mut_ptr(), at as *const u8, len) }.then_some(out)
+            };
+            let base = plane_parameters as usize;
+            let words: Vec<u32> = read(base, 128)
+                .map(|b| b.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                .unwrap_or_default();
+            let word = |at: usize| read(at, 8).map(|b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+            let found: Vec<String> = [32usize, 40, 48, 56, 64, 72, 80]
+                .iter()
+                .filter_map(|&stride| {
+                    let count = word(base + stride + 8)? as u32;
+                    let list = word(base + stride + 16)? as usize;
+                    if count == 0 || count > 8 || list < 0x10000 {
+                        return None;
+                    }
+                    let r = word(list)? as usize as This;
+                    let t = crate::resource::host_resource(r)?;
+                    let p = Plane { token: 0, count, resources: std::ptr::null() };
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    Some(format!("stride {stride}: {} resources, {}x{} format {}", p.count, d.Width, d.Height, d.Format.0))
+                })
+                .collect();
+            let first = unsafe { plane_parameters.as_ref() }
+                .filter(|p| p.count > 0 && !p.resources.is_null())
+                .and_then(|p| crate::resource::host_resource(unsafe { *p.resources }))
+                .map(|t| {
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    format!("{}x{} format {}", d.Width, d.Height, d.Format.0)
+                });
+            tracing::info!(planes, ?first, ?found, ?words, "a present with more than one plane");
+        }
+    }
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -828,8 +874,25 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The second plane, shown over the first (`Host::present`): plane
+        // descriptions are 72 bytes apart (measured in the Series S mode:
+        // the second's resource list at 72 + 16).
+        // SAFETY: the title passes `planes` descriptions.
+        let second = (planes > 1)
+            .then(|| unsafe { &*plane_parameters.cast::<u8>().add(72).cast::<Plane>() })
+            .filter(|p| p.count > 0 && !p.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|p| unsafe { *p.resources })
+            .and_then(|r| crate::resource::host_resource(r).map(|t| (r, t.clone())));
+        let over_state = second.as_ref().map(|(r, _)| {
+            crate::resource::host_transition(*r, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before)
+        });
+        let overlay = second.as_ref().zip(over_state).map(|((_, t), s)| (t, s));
+        let shown = host.present(texture, state, overlay, frame);
         crate::resource::host_transition(resource, state);
+        if let (Some((r, _)), Some(s)) = (&second, over_state) {
+            crate::resource::host_transition(*r, s);
+        }
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

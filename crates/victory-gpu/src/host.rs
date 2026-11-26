@@ -5793,7 +5793,52 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The pass that puts a present's second plane over its first
+    /// ([`PLANE_COMPOSE`]), made on first use; `None` inside if it cannot be.
+    compose: Option<Option<Compose>>,
 }
+
+/// What [`PLANE_COMPOSE`] runs with: its root signature and pipeline, a
+/// heap of views in rings of three (the first plane, the second, the
+/// target), the size of a view, the next ring, and the target it writes
+/// (size and texture), kept in unordered access between presents.
+struct Compose {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    heap: ID3D12DescriptorHeap,
+    step: usize,
+    next: usize,
+    target: Option<(u32, u32, ID3D12Resource)>,
+}
+
+/// Rings of views in [`Compose::heap`]: presents in the air each use
+/// their own.
+const COMPOSE_RINGS: usize = 64;
+
+/// The console's display hardware shows a present's planes one over the
+/// other; the host presents one texture. A title that puts its interface
+/// on a plane of its own (Grand Theft Auto VI in the Series S mode: the
+/// scene 1920x1080 under a 3840x2160 interface plane, menus and loading
+/// screens on the second plane only) showed a black screen with only the
+/// first plane presented. The second is put over the first, scaled to it,
+/// its colour taken as premultiplied by its alpha.
+const PLANE_COMPOSE: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_LINEAR, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+cbuffer Size : register(b0) { uint width; uint height; };
+Texture2D<float4> under : register(t0);
+Texture2D<float4> over : register(t1);
+RWTexture2D<float4> target : register(u0);
+SamplerState linear_clamp : register(s0);
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2(width, height);
+    float4 u = under.SampleLevel(linear_clamp, uv, 0);
+    float4 o = over.SampleLevel(linear_clamp, uv, 0);
+    target[id.xy] = float4(o.rgb + u.rgb * (1.0 - o.a), 1.0);
+}
+"#;
 
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
@@ -6065,7 +6110,56 @@ impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// [`PLANE_COMPOSE`]'s root signature and pipeline, or why not.
+    fn make_compose(&self) -> windows::core::Result<Compose> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the calls; the blob's
+        // own bytes, with the root signature inside the shader.
+        unsafe {
+            D3DCompile(
+                PLANE_COMPOSE.as_ptr().cast(),
+                PLANE_COMPOSE.len(),
+                windows::core::s!("plane compose"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )?;
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
+            let heap: ID3D12DescriptorHeap = self.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: (COMPOSE_RINGS * 3) as u32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
+            let step = self.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            Ok(Compose { root, pso, heap, step, next: 0, target: None })
+        }
+    }
+
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -6125,37 +6219,110 @@ impl Host {
             } else {
                 None
             };
+            // A second plane over the first: both in 8-bit colour, the pass
+            // there, and a target the first plane's size.
+            let overlay = overlay.filter(|(o, _)| {
+                format == DXGI_FORMAT_R8G8B8A8_UNORM && swap_format(o.GetDesc().Format) == Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+            });
+            if overlay.is_some() && p.compose.is_none() {
+                p.compose = Some(match self.make_compose() {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "planes over planes cannot be shown: the first plane only");
+                        None
+                    }
+                });
+            }
+            let mut composed: Option<(ID3D12Resource, usize)> = None;
+            if let (Some(_), Some(Some(c))) = (overlay, p.compose.as_mut()) {
+                if c.target.as_ref().is_none_or(|t| (t.0, t.1) != (width, height)) {
+                    let made = self.uav_texture(width, height, DXGI_FORMAT_R8G8B8A8_UNORM);
+                    if let Some(t) = &made {
+                        name(t, || "presented planes, composed".into());
+                    }
+                    c.target = made.map(|t| (width, height, t));
+                }
+                if let Some((_, _, target)) = &c.target {
+                    let ring = c.next;
+                    c.next = (c.next + 1) % COMPOSE_RINGS;
+                    composed = Some((target.clone(), ring));
+                }
+            }
             let copy = match slot {
                 Some(i) => &p.ahead[i].0,
                 None => &p.copy,
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            // What goes to the back buffer: the first plane, or the planes
+            // composed.
+            let shown: ID3D12Resource = match (&composed, overlay, p.compose.as_ref()) {
+                (Some((target, ring)), Some((over, over_state)), Some(Some(c))) => {
+                    let over_state = D3D12_RESOURCE_STATES(over_state as i32);
+                    let cpu = c.heap.GetCPUDescriptorHandleForHeapStart().ptr + ring * 3 * c.step;
+                    let gpu = c.heap.GetGPUDescriptorHandleForHeapStart().ptr + (ring * 3 * c.step) as u64;
+                    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, ..Default::default() },
+                        },
+                    };
+                    self.device.CreateShaderResourceView(texture, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu });
+                    self.device.CreateShaderResourceView(over, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + c.step });
+                    self.device.CreateUnorderedAccessView(
+                        target,
+                        None,
+                        None,
+                        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + 2 * c.step },
+                    );
+                    list.ResourceBarrier(&[
+                        transition(texture, state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                        transition(over, over_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    ]);
+                    list.SetDescriptorHeaps(&[Some(c.heap.clone())]);
+                    list.SetComputeRootSignature(&c.root);
+                    list.SetPipelineState(&c.pso);
+                    list.SetComputeRoot32BitConstants(0, 2, [width, height].as_ptr().cast(), 0);
+                    list.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu });
+                    list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+                    list.ResourceBarrier(&[
+                        transition(texture, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, state),
+                        transition(over, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, over_state),
+                        transition(target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                    ]);
+                    target.clone()
+                }
+                _ => {
+                    list.ResourceBarrier(&[
+                        transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                        transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST),
+                    ]);
+                    texture.clone()
+                }
+            };
+            list.CopyResource(&back, &shown);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, &shown))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, &shown) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            if composed.is_some() && overlay.is_some() {
+                list.ResourceBarrier(&[
+                    transition(&shown, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+                ]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT),
+                ]);
+            }
             copy.close();
             match slot {
                 Some(i) => {
@@ -6218,6 +6385,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                compose: None,
             })
         }
     }
@@ -6347,6 +6515,43 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    /// A 2D texture of ours in the card's memory that shaders write
+    /// (unordered access), created in that state.
+    pub(crate) fn uav_texture(&self, width: u32, height: u32, format: DXGI_FORMAT) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(width),
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut texture,
+            )
+        };
+        match made {
+            Ok(()) => texture,
+            Err(e) => {
+                tracing::warn!(error = %e, width, height, "no texture for composed planes");
+                None
+            }
+        }
+    }
+
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
