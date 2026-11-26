@@ -2262,7 +2262,32 @@ pub(crate) fn settle_now(why: usize) {
         return;
     };
     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+    let held = std::time::Instant::now();
     host.settle(&mut submitted, why);
+    drop(submitted);
+    // Diagnostics: who holds the submission lock, for how long.
+    let us = held.elapsed().as_micros() as u64;
+    let other = SUBMITTER.load(Ordering::Relaxed) != crate::host::thread_number();
+    LOCK_HELD[usize::from(other)].fetch_add(us, Ordering::Relaxed);
+    LOCK_HELD[2 + usize::from(other)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Diagnostics: microseconds the submission lock was held by `settle_now`
+/// on the submitting thread, on another thread, and how many times each;
+/// then by submissions from a thread other than the last submitting one.
+static LOCK_HELD: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+/// Diagnostics: microseconds of a submission before it counts as started,
+/// in the sweep of objects let go and in making slots that waited for a
+/// texture (`LOCK_HELD[5]`: the settles for flights).
+static BEFORE_START: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// The thread that last submitted ([`thread_number`]).
+static SUBMITTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A number for the calling thread, unique while the process lives.
+pub(crate) fn thread_number() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    thread_local! { static MINE: u64 = NEXT.fetch_add(1, Ordering::Relaxed); }
+    MINE.with(|m| *m)
 }
 
 /// [`settle_now`] at a present, and for a fence the title blocks on.
@@ -4034,8 +4059,17 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        {
+            // Diagnostics: submissions from more than one thread.
+            let me = thread_number();
+            let last = SUBMITTER.swap(me, Ordering::Relaxed);
+            if last != 0 && last != me {
+                LOCK_HELD[4].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let was_working = working(true);
         submitting(1, runs.len());
+        let part = std::time::Instant::now();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -4050,6 +4084,8 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        LOCK_HELD[5].fetch_add(part.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let part = std::time::Instant::now();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -4066,10 +4102,13 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        BEFORE_START[0].fetch_add(part.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let part = std::time::Instant::now();
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        BEFORE_START[1].fetch_add(part.elapsed().as_micros() as u64, Ordering::Relaxed);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5949,6 +5988,19 @@ impl Meter {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::by_call_line(frames);
+        {
+            let [own, other, own_n, other_n, switches, settles] =
+                [0, 1, 2, 3, 4, 5].map(|i| LOCK_HELD[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [sweep, waiting] = [0, 1].map(|i| BEFORE_START[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the submission lock per frame: settles on the submitting thread {:.1} ms in {own_n:.1}, on other threads {:.1} ms in {other_n:.1}; submissions from another thread than the one before {switches:.1}; before a submission starts: settling flights {:.1} ms, the sweep {:.1} ms, slots that waited for textures {:.1} ms",
+                own / 1e3,
+                other / 1e3,
+                settles / 1e3,
+                sweep / 1e3,
+                waiting / 1e3
+            );
+        }
         // Passes over the heap's buffer views for shaders that pick them by index.
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
