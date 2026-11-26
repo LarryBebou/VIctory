@@ -320,6 +320,46 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     out
 }
 
+/// Ranges of a copy's card side shorter than this go up as dwords put in by
+/// a pass of ours (`crate::host::CARD_SCATTER`), not each as a copy: the
+/// title's changes put in beside shaders' writes go up as the bytes that
+/// differ ([`Shadow::merge_under_writes`]), and in an experiment that put
+/// them in everywhere shaders write the world's frame had 470,000-490,000
+/// of them (3.5 MB): as copies the card took 0.6-4 s a frame on them.
+pub(crate) const SCATTER_MOST: usize = 256;
+
+/// The dwords that `ranges` (offsets in `held`, in order and apart) touch,
+/// each once, as (dword index, mask of the bytes in the ranges, the dword
+/// of `held`), added to `entries`.
+fn scatter_entries(held: &[u8], ranges: &[(usize, usize)], entries: &mut Vec<[u32; 3]>) {
+    for &(a, b) in ranges {
+        let b = b.min(held.len());
+        if a >= b {
+            continue;
+        }
+        for dword in a / 4..=(b - 1) / 4 {
+            let at = dword * 4;
+            let mut mask = 0u32;
+            for byte in 0..4 {
+                if at + byte >= a && at + byte < b {
+                    mask |= 0xff << (byte * 8);
+                }
+            }
+            let mut word = [0u8; 4];
+            let n = (held.len() - at).min(4);
+            word[..n].copy_from_slice(&held[at..at + n]);
+            let value = u32::from_le_bytes(word);
+            match entries.last_mut() {
+                Some(last) if last[0] == dword as u32 => {
+                    last[1] |= mask;
+                    last[2] = value;
+                }
+                _ => entries.push([dword as u32, mask, value]),
+            }
+        }
+    }
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
@@ -1401,6 +1441,23 @@ mod merge_tests {
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
+    #[test]
+    fn scatter_entries_cover_each_byte_once_by_dword() {
+        let held: Vec<u8> = (0..32u8).collect();
+        let mut entries = Vec::new();
+        super::scatter_entries(&held, &[(1, 3), (5, 6), (7, 10), (16, 20)], &mut entries);
+        let word = |d: usize| u32::from_le_bytes([held[d * 4], held[d * 4 + 1], held[d * 4 + 2], held[d * 4 + 3]]);
+        assert_eq!(
+            entries,
+            vec![
+                [0, 0x00ff_ff00, word(0)],
+                [1, 0xff00_ff00, word(1)],
+                [2, 0x0000_ffff, word(2)],
+                [4, 0xffff_ffff, word(4)],
+            ]
+        );
+    }
+
     #[test]
     fn changed_runs_are_exactly_the_bytes_that_differ() {
         let was: Vec<u8> = (0..300u32).map(|i| (i * 13 + 5) as u8).collect();
@@ -2606,6 +2663,34 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
+    /// For [`crate::host`]'s update of a copy's card side: of `ranges`
+    /// (offsets, in order and apart), those of `SCATTER_MOST` bytes or more
+    /// are returned, to be copied; the others are added to `entries` as
+    /// dwords of the CPU's side to put in on the card (see [`scatter_entries`]).
+    pub(crate) fn card_scatter(&self, ranges: &[(usize, usize)], entries: &mut Vec<[u32; 3]>) -> Vec<(usize, usize)> {
+        let mut copied = Vec::new();
+        let small: Vec<(usize, usize)> = ranges
+            .iter()
+            .copied()
+            .filter(|&(a, b)| {
+                if b - a >= SCATTER_MOST {
+                    copied.push((a, b));
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if !small.is_empty() {
+            let size = self.card.as_ref().map_or(0, |c| c.size as usize);
+            // SAFETY: the CPU's side is mapped whole (`size` bytes, a
+            // multiple of 64 KiB); only the submitting thread writes it.
+            let held = unsafe { std::slice::from_raw_parts(self.data.cast_const(), size) };
+            scatter_entries(held, &small, entries);
+        }
+        copied
+    }
+
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -2881,6 +2966,23 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
+}
+
+/// The copy in the card's memory ([`cards`]) of the innermost title buffer
+/// holding `[address, address + len)`, if that copy is there already:
+/// nothing is made (an ask that has another way to read the bytes).
+pub(crate) fn carded_at(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !cards() {
+        return None;
+    }
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone())
+        .filter(|s| s.card.is_some())
 }
 
 /// The copy of the innermost title buffer holding `[address, address +

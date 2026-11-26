@@ -364,6 +364,65 @@ fn dropped(pipeline: usize) {
     }
 }
 
+/// The pass of [`State::copy_on_card`]: its root signature and pipeline,
+/// made on first use (`None` if they cannot be).
+fn card_copy_work() -> Option<&'static (ID3D12RootSignature, ID3D12PipelineState)> {
+    const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) { uint dwords; };
+RWByteAddressBuffer src : register(u0);
+RWByteAddressBuffer dst : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= dwords) return;
+    dst.Store(id.x * 4, src.Load(id.x * 4));
+}
+"#;
+    static WORK: std::sync::OnceLock<Option<(ID3D12RootSignature, ID3D12PipelineState)>> = std::sync::OnceLock::new();
+    WORK.get_or_init(|| {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let host = crate::host::host()?;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the calls; the out
+        // pointer is ours; the blob's own bytes, with the root signature
+        // inside the shader.
+        unsafe {
+            D3DCompile(
+                SOURCE.as_ptr().cast(),
+                SOURCE.len(),
+                windows::core::s!("card copy"),
+                None,
+                None,
+                windows::core::s!("main"),
+                windows::core::s!("cs_5_1"),
+                0,
+                0,
+                &mut code,
+                None,
+            )
+            .ok()?;
+            let code = code?;
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).ok()?;
+            let pso: ID3D12PipelineState = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })
+                .ok()?;
+            Some((root, pso))
+        }
+    })
+    .as_ref()
+}
+
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 
@@ -631,6 +690,74 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+    }
+
+    /// The title's copy of `len` bytes of title memory `from` to `to` (a
+    /// buffer copy) whose source is in a copy in the card's memory: done
+    /// between the host copies on the card, in the list's order, by a pass
+    /// of ours; the destination is declared written by shaders, so what the
+    /// pass wrote goes back to title memory as theirs does. Done on the CPU
+    /// in title memory at submission, the copy read bytes that flights in
+    /// the air may write (the world's 174 MB heap), and the submission
+    /// waited for the card first (20-40 ms a frame in the Series S world).
+    /// Whether it was done here; else the caller copies on the CPU.
+    pub(crate) fn copy_on_card(&mut self, list: &HostList, to: usize, from: usize, len: usize) -> bool {
+        if len == 0 || len % 4 != 0 {
+            return false;
+        }
+        let (Some(src), Some(dst)) = (
+            crate::shadow::find(from as u64, len as u64),
+            crate::shadow::find(to as u64, len as u64),
+        ) else {
+            return false;
+        };
+        let (src_gpu, dst_gpu) = (src.gpu(from as u64), dst.gpu(to as u64));
+        if src_gpu % 4 != 0 || dst_gpu % 4 != 0 {
+            return false;
+        }
+        let Some(work) = card_copy_work() else {
+            return false;
+        };
+        // The source as the title holds it now, and what shaders wrote
+        // there before; the destination is the copy's from here on.
+        src.refresh(list, from as u64, len as u64);
+        dst.gpu_writes(list, to as u64, len as u64, "buffer copy on the card");
+        let dwords = (len / 4) as u32;
+        let wait = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(None),
+                }),
+            },
+        };
+        // SAFETY: an open list; our root signature and pipeline; both
+        // ranges lie in live host copies the list keeps (the refresh and
+        // write steps hold them).
+        unsafe {
+            let l = &list.list;
+            l.ResourceBarrier(std::slice::from_ref(&wait));
+            l.SetComputeRootSignature(&work.0);
+            l.SetPipelineState(&work.1);
+            const GROUPS: u32 = 65_535;
+            let mut done = 0u32;
+            while done < dwords {
+                let n = (dwords - done).min(GROUPS * 64);
+                l.SetComputeRoot32BitConstants(0, 1, (&raw const n).cast(), 0);
+                l.SetComputeRootUnorderedAccessView(1, src_gpu + u64::from(done) * 4);
+                l.SetComputeRootUnorderedAccessView(2, dst_gpu + u64::from(done) * 4);
+                l.Dispatch(n.div_ceil(64), 1, 1);
+                done += n;
+            }
+            l.ResourceBarrier(std::slice::from_ref(&wait));
+        }
+        // The title's next draw or dispatch binds its own again.
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::CardCopies, len as u64);
+        true
     }
 
     pub(crate) fn replay(&mut self, list: &HostList) {
@@ -2063,6 +2190,32 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In a buffer whose copy is in the card's memory
+                        // (the world's per-draw constants are in the 174 MB
+                        // heap): read on the card, from that copy brought up
+                        // to date. A copy into upload memory read title
+                        // memory on the CPU at submission, where the writes
+                        // of flights in the air are not, and shaders may
+                        // write anywhere in that heap (its unordered view is
+                        // declared whole): the submission waited for the
+                        // card first, 41-76 ms a frame on an RTX 5060, for
+                        // 480 bytes no shader wrote. On the card they are
+                        // read after those shaders, in the queue's order.
+                        if let Some(shadow) = crate::shadow::carded_at(address, u64::from(size)) {
+                            shadow.refresh(list, address, u64::from(size));
+                            let gpu = shadow.gpu(address);
+                            if gpu % 256 == 0 {
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                            // The host's views start on 256 bytes, the
+                            // console's on 16: copied on the card first.
+                            if let Some((buffer, at, gpu)) = list.card_constant(u64::from(size)) {
+                                list.defer_card_fill(&shadow, address, u64::from(size), buffer, at);
+                                host.constant_at(index, gpu, size);
+                                continue;
+                            }
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

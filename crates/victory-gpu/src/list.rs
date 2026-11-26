@@ -829,10 +829,30 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        copy_title_buffer(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+/// A title buffer copy: on the card between host copies when its source is
+/// in a copy in the card's memory ([`crate::draw::State::copy_on_card`]),
+/// else on the CPU in title memory when the list is submitted.
+#[cfg(windows)]
+fn copy_title_buffer(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, len: usize) {
+    // `VICTORY_CARD_COPY=1` (off by default): on the card. The first
+    // Series S run with it hung the card 21 s into the world; the cause is
+    // not found yet.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPY").is_some_and(|v| v == "1"));
+    if on && crate::shadow::carded_at(from as u64, len as u64).is_some() {
+        let mut done = false;
+        with_state(this, |list, state| done = state.copy_on_card(list, to as usize, from as usize, len));
+        if done {
+            return;
+        }
+    }
+    list.defer_copy(to, from, len);
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
@@ -882,7 +902,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            copy_title_buffer(this, list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]

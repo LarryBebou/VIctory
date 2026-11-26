@@ -131,6 +131,8 @@ pub(crate) enum C {
     /// the bytes the CPU's side held already (not sent up).
     CardCopied,
     CardSame,
+    /// Bytes of title buffer copies done on the card between host copies.
+    CardCopies,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1125,7 +1127,7 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; into copies in the card's memory \
-         {:.1} MB, {:.1} MB of them as they were (not sent up)",
+         {:.1} MB, {:.1} MB of them as they were (not sent up); buffer copies on the card {:.2} MB",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1151,6 +1153,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
         mb(c[C::CardCopied as usize]),
         mb(c[C::CardSame as usize]),
+        mb(c[C::CardCopies as usize]),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
